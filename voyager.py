@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# voyager.py — updated with separate flow control & congestion control
+# voyager.py — Updated with correct ack_type logic, fast retransmit, and logs
 
 import socket
 import argparse
@@ -7,7 +7,7 @@ import threading
 import time
 import hashlib
 import struct
-import os
+import random
 
 ###############################################################################
 # Utility
@@ -19,11 +19,8 @@ def checksum(data: bytes) -> str:
 ###############################################################################
 # Voyager Header Format
 ###############################################################################
-# | SEQ (4B) | ACK (4B) | FLAGS (1B) | RWND (4B) | LEN (2B) | CHECKSUM (16B) |
-# Total: 31 bytes
 HEADER_FORMAT = "!IIBIH16s"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
-
 FLAG_SYN = 1
 FLAG_ACK = 2
 FLAG_FIN = 4
@@ -38,30 +35,32 @@ class CongestionControl:
         self.dup_acks = 0
 
     def apply(self, ack_type):
-        """Applies congestion control based on ack_type.
-        ack_type ∈ {"new_ack", "dup_ack", "timeout"}
-        Returns: "fast_retx" if triggered.
-        """
+        action = None
         if ack_type == "new_ack":
             self.dup_acks = 0
             if self.cwnd < self.ssthresh:
                 self.cwnd += 1
+                print(f"[CC] Slow start: cwnd={self.cwnd}")
             else:
                 self.cwnd += 1 / self.cwnd
+                print(f"[CC] Congestion avoidance: cwnd={self.cwnd:.2f}")
 
         elif ack_type == "dup_ack":
             self.dup_acks += 1
+            print(f"[CC] Duplicate ACK detected ({self.dup_acks})")
             if self.dup_acks == 3:
                 self.ssthresh = max(int(self.cwnd // 2), 1)
                 self.cwnd = self.ssthresh
-                return "fast_retx"
+                print(f"[CC] Fast retransmit triggered! ssthresh={self.ssthresh}, cwnd={self.cwnd}")
+                action = "fast_retx"
 
         elif ack_type == "timeout":
             self.ssthresh = max(int(self.cwnd // 2), 1)
             self.cwnd = 1
             self.dup_acks = 0
+            print(f"[CC] Timeout: cwnd reset to {self.cwnd}, ssthresh={self.ssthresh}")
 
-        return None
+        return action
 
 ###############################################################################
 # Flow Control
@@ -72,6 +71,7 @@ class FlowControl:
 
     def apply(self, receiver_rwnd):
         self.send_window = min(self.send_window, receiver_rwnd)
+        print(f"[FLOW CONTROL] Limiting window to RWND={receiver_rwnd}")
 
 ###############################################################################
 # Voyager Sender
@@ -105,15 +105,20 @@ class VoyagerClient:
                 data, _ = self.sock.recvfrom(2048)
                 seq, ack, flags, rwnd, length, csum = struct.unpack(HEADER_FORMAT, data[:HEADER_SIZE])
                 if flags & FLAG_SYN and flags & FLAG_ACK:
+                    print("[HANDSHAKE] SYN+ACK received")
                     return
             except socket.timeout:
+                print("[HANDSHAKE] Timeout, resending SYN")
                 self.sock.sendto(pkt, self.server)
 
     def send_file(self):
         data = open(self.file, "rb").read()
         total = len(data)
-
         while self.base <= total:
+            # Apply flow control
+            self.fc.apply(self.receiver_rwnd)
+
+            # Send data up to cwnd and flow control
             while len(self.unacked) < int(self.cc.cwnd) and (self.next_seq <= total):
                 chunk = data[self.next_seq-1:self.next_seq+999]
                 pkt = self.send_header(self.next_seq, 0, 0, 0, chunk)
@@ -121,23 +126,40 @@ class VoyagerClient:
                 self.sock.sendto(pkt, self.server)
                 self.next_seq += len(chunk)
 
+            # Receive ACKs
             try:
                 resp, _ = self.sock.recvfrom(2048)
                 seq, ack, flags, rwnd, length, csum = struct.unpack(HEADER_FORMAT, resp[:HEADER_SIZE])
+
+                # Check for duplicate ACKs
                 if ack > self.base:
-                    self.cc.apply("new_ack")
-                    for s in list(self.unacked.keys()):
-                        if s < ack:
-                            del self.unacked[s]
-                    self.base = ack
+                    ack_type = "new_ack"
+                elif ack == self.base:
+                    ack_type = "dup_ack"
+                else:
+                    continue  # stale ack, ignore
+
+                action = self.cc.apply(ack_type)
+                if action == "fast_retx":
+                    oldest = min(self.unacked.keys())
+                    self.sock.sendto(self.unacked[oldest][0], self.server)
+
+                # Remove acknowledged packets
+                for s in list(self.unacked.keys()):
+                    if s < ack:
+                        del self.unacked[s]
+                self.base = max(self.base, ack)
 
             except socket.timeout:
+                print("[TIMEOUT] ACK timeout, retransmitting oldest")
                 self.cc.apply("timeout")
                 for s, (pkt, _) in self.unacked.items():
                     self.sock.sendto(pkt, self.server)
 
+        # Send FIN
         fin = self.send_header(self.next_seq, 0, FLAG_FIN, 0, b"")
         self.sock.sendto(fin, self.server)
+        print("[TRANSFER] File transfer complete")
 
 ###############################################################################
 # Voyager Server
@@ -156,6 +178,7 @@ class VoyagerServer:
     def send_ack(self, addr):
         ack_pkt = struct.pack(HEADER_FORMAT, 0, self.expected_seq, FLAG_ACK, self.rwnd, 0, checksum(b""))
         self.sock.sendto(ack_pkt, addr)
+        print(f"[ACK] Sent ACK for seq {self.expected_seq}")
 
     def run(self):
         while True:
@@ -166,6 +189,7 @@ class VoyagerServer:
             if flags & FLAG_SYN:
                 synack = struct.pack(HEADER_FORMAT, 0, 1, FLAG_SYN | FLAG_ACK, self.rwnd, 0, checksum(b""))
                 self.sock.sendto(synack, addr)
+                print(f"[HANDSHAKE] SYN received, SYN+ACK sent")
                 continue
 
             if seq == self.expected_seq:
@@ -181,6 +205,7 @@ class VoyagerServer:
 
             if flags & FLAG_FIN:
                 self.output.close()
+                print("[FIN] Transfer complete, file saved")
                 return
 
 ###############################################################################
