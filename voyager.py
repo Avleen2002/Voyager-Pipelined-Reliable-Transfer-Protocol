@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-# voyager.py — Updated with correct ack_type logic, fast retransmit, and logs
-
 import socket
 import argparse
 import threading
@@ -12,7 +10,6 @@ import random
 ###############################################################################
 # Utility
 ###############################################################################
-
 def checksum(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()[:16].encode()
 
