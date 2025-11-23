@@ -7,22 +7,24 @@ import hashlib
 import struct
 import random
 
-
-# Check-sum helper
+###############################################################################
+# Utility
+###############################################################################
 def checksum(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()[:16].encode()
 
-# Header Format
-HEADER_FORMAT = "!IIBIH16s"                     # ! - network byte order (big-endian), I - unsigned int (4 bytes), 
-                                                # H - unsigned short (2 bytes), B - unsigned char (1 byte), 16s - 16 byte string
-HEADER_SIZE = struct.calcsize(HEADER_FORMAT)    # 31 byte
+###############################################################################
+# Voyager Header Format
+###############################################################################
+HEADER_FORMAT = "!IIBIH16s"
+HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 FLAG_SYN = 1
 FLAG_ACK = 2
 FLAG_FIN = 4
-FLAG_DATA = 8  
 
-
-# Congestion Control State - use TCP Reno
+###############################################################################
+# Congestion Control State
+###############################################################################
 class CongestionControl:
     def __init__(self):
         self.cwnd = 1
@@ -57,7 +59,9 @@ class CongestionControl:
 
         return action
 
-# Flow Control - TCP's receiver-advertised window
+###############################################################################
+# Flow Control
+###############################################################################
 class FlowControl:
     def __init__(self):
         self.send_window = 32 * 1024  # default max
@@ -66,12 +70,10 @@ class FlowControl:
         self.send_window = min(self.send_window, receiver_rwnd)
         print(f"[FLOW CONTROL] Limiting window to RWND={receiver_rwnd}")
 
-
-# Client
+###############################################################################
+# Voyager Sender
+###############################################################################
 class VoyagerClient:
-    LOSS_PROB = 0.10          # 10% packet drop
-    CORRUPT_PROB = 0.02       # 2% corruption
-
     def __init__(self, server_ip, server_port, filename):
         self.server = (server_ip, server_port)
         self.file = filename
@@ -83,117 +85,82 @@ class VoyagerClient:
         self.cc = CongestionControl()
         self.fc = FlowControl()
         self.receiver_rwnd = 64 * 1024
-        self.unacked = {}     # seq -> (pkt, send_time)
+        self.unacked = {}
+        self.rto = 1.0
+        self.srtt = None
 
-    # Loss + corruption simulation 
-    def udt_send(self, pkt):
-        # Simulate corruption
-        if random.random() < self.CORRUPT_PROB:
-            pkt = bytearray(pkt)
-            idx = random.randint(0, len(pkt)-1)
-            pkt[idx] ^= 0xFF
-            pkt = bytes(pkt)
-            print("[CORRUPT] Packet corrupted")
-
-        # Simulate loss
-        if random.random() < self.LOSS_PROB:
-            print("[LOSS] Outgoing packet dropped")
-            return False
-
-        self.sock.sendto(pkt, self.server)
-        return True
-    
-    # Packets
     def send_header(self, seq, ack, flags, rwnd, payload):
         csum = checksum(payload)
         hdr = struct.pack(HEADER_FORMAT, seq, ack, flags, rwnd, len(payload), csum)
         return hdr + payload
 
-    # 2-Way Handshake
     def handshake(self):
-        syn = self.send_header(0, 0, FLAG_SYN, 0, b"")
-        self.udt_send(syn)
-        print("[HANDSHAKE] Sent SYN")
-
+        pkt = self.send_header(0, 0, FLAG_SYN, 0, b"")
+        self.sock.sendto(pkt, self.server)
         while True:
             try:
                 data, _ = self.sock.recvfrom(2048)
-                seq, ack, flags, rwnd, length, csum = struct.unpack(
-                    HEADER_FORMAT, data[:HEADER_SIZE]
-                )
-
-                if (flags & FLAG_SYN) and (flags & FLAG_ACK):
-                    print("[HANDSHAKE] SYN+ACK received — connection established")
+                seq, ack, flags, rwnd, length, csum = struct.unpack(HEADER_FORMAT, data[:HEADER_SIZE])
+                if flags & FLAG_SYN and flags & FLAG_ACK:
+                    print("[HANDSHAKE] SYN+ACK received")
                     return
             except socket.timeout:
                 print("[HANDSHAKE] Timeout, resending SYN")
-                self.udt_send(syn)
+                self.sock.sendto(pkt, self.server)
 
-    # Data Transfer
     def send_file(self):
         data = open(self.file, "rb").read()
         total = len(data)
-
         while self.base <= total:
-
             # Apply flow control
-            allowed_bytes = min(self.receiver_rwnd, int(self.cc.cwnd) * 1000)
+            self.fc.apply(self.receiver_rwnd)
 
-            # Send packets
-            while (self.next_seq <= total and
-                   len(self.unacked) < int(self.cc.cwnd) and
-                   (self.next_seq - self.base) < allowed_bytes):
-
+            # Send data up to cwnd and flow control
+            while len(self.unacked) < int(self.cc.cwnd) and (self.next_seq <= total):
                 chunk = data[self.next_seq-1:self.next_seq+999]
-                pkt = self.send_header(self.next_seq, 0, FLAG_DATA, 0, chunk)
+                pkt = self.send_header(self.next_seq, 0, 0, 0, chunk)
                 self.unacked[self.next_seq] = (pkt, time.time())
-                self.udt_send(pkt)
-                # print(f"[SEND] seq={self.next_seq}")
-
+                self.sock.sendto(pkt, self.server)
                 self.next_seq += len(chunk)
 
             # Receive ACKs
             try:
                 resp, _ = self.sock.recvfrom(2048)
-                seq, ack, flags, rwnd, length, csum = struct.unpack(
-                    HEADER_FORMAT, resp[:HEADER_SIZE]
-                )
+                seq, ack, flags, rwnd, length, csum = struct.unpack(HEADER_FORMAT, resp[:HEADER_SIZE])
 
-                # Update rwnd from receiver
-                self.receiver_rwnd = rwnd
-
+                # Check for duplicate ACKs
                 if ack > self.base:
-                    action = self.cc.apply("new_ack")
-
-                    # Remove ACKed packets
-                    for s in list(self.unacked.keys()):
-                        if s < ack:
-                            del self.unacked[s]
-
-                    self.base = ack
-
+                    ack_type = "new_ack"
                 elif ack == self.base:
-                    action = self.cc.apply("dup_ack")
-                    if action == "fast_retx":
-                        oldest = min(self.unacked.keys())
-                        print(f"[FAST RETX] Retransmitting seq={oldest}")
-                        self.udt_send(self.unacked[oldest][0])
+                    ack_type = "dup_ack"
+                else:
+                    continue  # stale ack, ignore
+
+                action = self.cc.apply(ack_type)
+                if action == "fast_retx":
+                    oldest = min(self.unacked.keys())
+                    self.sock.sendto(self.unacked[oldest][0], self.server)
+
+                # Remove acknowledged packets
+                for s in list(self.unacked.keys()):
+                    if s < ack:
+                        del self.unacked[s]
+                self.base = max(self.base, ack)
 
             except socket.timeout:
-                print("[TIMEOUT] No ACK — retransmitting window")
+                print("[TIMEOUT] ACK timeout, retransmitting oldest")
                 self.cc.apply("timeout")
-
                 for s, (pkt, _) in self.unacked.items():
-                    self.udt_send(pkt)
-                    self.unacked[s] = (pkt, time.time())
+                    self.sock.sendto(pkt, self.server)
 
         # Send FIN
         fin = self.send_header(self.next_seq, 0, FLAG_FIN, 0, b"")
-        self.udt_send(fin)
-        print("[FIN] FIN sent — transfer complete")
-        self.sock.close()
+        self.sock.sendto(fin, self.server)
+        print("[TRANSFER] File transfer complete")
 
+###############################################################################
 # Voyager Server
+###############################################################################
 class VoyagerServer:
     def __init__(self, port, outfile, rwnd=65535):
         self.port = port
@@ -216,38 +183,31 @@ class VoyagerServer:
             seq, ack, flags, rwnd, length, csum = struct.unpack(HEADER_FORMAT, data[:HEADER_SIZE])
             payload = data[HEADER_SIZE:HEADER_SIZE+length]
 
-            if flags & FLAG_FIN:
-                print("[FIN] FIN received, closing file")
-                self.output.close()
-                return
             if flags & FLAG_SYN:
-                synack = struct.pack(
-                    HEADER_FORMAT, 0, 1,
-                    FLAG_SYN | FLAG_ACK, self.rwnd, 0,
-                    checksum(b"")
-                )
+                synack = struct.pack(HEADER_FORMAT, 0, 1, FLAG_SYN | FLAG_ACK, self.rwnd, 0, checksum(b""))
                 self.sock.sendto(synack, addr)
-                print("[HANDSHAKE] SYN received → SYN+ACK sent")
+                print(f"[HANDSHAKE] SYN received, SYN+ACK sent")
                 continue
-            # verify checksum
-            if checksum(payload) != csum:
-                print(f"[CORRUPTION] Packet corrupted, dropping seq={seq}")
-                continue
-            # in-order
+
             if seq == self.expected_seq:
                 self.output.write(payload)
                 self.expected_seq += len(payload)
-                # flush buffer
                 while self.expected_seq in self.buf:
-                    p = self.buf.pop(self.expected_seq)
-                    self.output.write(p)
-                    self.expected_seq += len(p)
+                    self.output.write(self.buf[self.expected_seq])
+                    del self.buf[self.expected_seq]
             else:
-                # out-of-order
                 self.buf[seq] = payload
 
             self.send_ack(addr)
 
+            if flags & FLAG_FIN:
+                self.output.close()
+                print("[FIN] Transfer complete, file saved")
+                return
+
+###############################################################################
+# Main
+###############################################################################
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--role", choices=["client", "server"])
